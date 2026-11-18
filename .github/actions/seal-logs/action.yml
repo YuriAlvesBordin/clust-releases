@@ -1,0 +1,31 @@
+name: seal-logs
+description: >
+  After a failure: encrypts everything in ./logs to .github/log-cert.pem and uploads only the
+  encrypted file, as the artifact logs-NAME. Only the holder of the certificate's private key can
+  read it (see the end of .github/workflows/release.yml).
+inputs:
+  name:
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+      run: |
+        if [ ! -d logs ]; then echo "no logs were written"; exit 0; fi
+        o=openssl
+        if [ "$RUNNER_OS" = macOS ]; then
+          # /usr/bin/openssl on macOS is LibreSSL; use OpenSSL 3 for cms
+          o="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+          if [ ! -x "$o" ]; then brew install -q openssl@3 > /dev/null; o="$(brew --prefix openssl@3)/bin/openssl"; fi
+        fi
+        for f in logs/*.log; do printf '===== %s\n' "$f"; cat "$f"; done > logs.txt
+        rm -rf logs
+        "$o" cms -encrypt -binary -aes256 -outform DER -in logs.txt -out "logs-$NAME.cms" .github/log-cert.pem
+        rm -f logs.txt
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: logs-${{ inputs.name }}
+        path: logs-${{ inputs.name }}.cms
+        if-no-files-found: ignore

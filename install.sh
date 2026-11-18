@@ -15,7 +15,7 @@ set -eu
 REPO="YuriAlvesBordin/clust-releases"
 # Public half of the release signing key: the same 32 bytes as UPDATE_PUBLIC_KEY in clust.
 PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA2I6WyDrts1PYmDy5L8lbWF2+rHq+3+N4tVdO0/e0GeU=
+MCowBQYDK2VwAyEAms2aVVz5LXP90dUK+z1VZmdI/PKNyxVuLia+eNUfX48=
 -----END PUBLIC KEY-----"
 
 say() { printf '%s\n' "clust: $*"; }

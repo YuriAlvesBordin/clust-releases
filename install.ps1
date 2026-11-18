@@ -19,8 +19,8 @@
 
     $Repo = 'YuriAlvesBordin/clust-releases'
     # Public half of the release signing key: the same 32 bytes as UPDATE_PUBLIC_KEY in clust.
-    $PublicKey = [byte[]](216, 142, 150, 200, 58, 237, 179, 83, 216, 152, 60, 185, 47, 201, 91, 88,
-        93, 190, 172, 122, 190, 223, 227, 120, 181, 87, 78, 211, 247, 180, 25, 229)
+    $PublicKey = [byte[]](154, 205, 154, 85, 92, 249, 45, 115, 253, 209, 213, 10, 251, 61, 85, 102,
+        103, 72, 252, 242, 141, 203, 21, 110, 46, 38, 190, 120, 213, 31, 95, 143)
 
     function Say($m) { Write-Host "clust: $m" }
 

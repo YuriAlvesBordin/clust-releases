@@ -1,0 +1,325 @@
+name: release
+# Builds, tests, signs and publishes Clust from its private source repository. This repository is
+# public, so its GitHub-hosted runners cost nothing. Everything below exists so that the source
+# never reaches anything public:
+#  - The source is fetched with a read-only deploy key of the source repository only
+#    (.github/actions/source); the key is never written to disk.
+#  - Every command that compiles, lints or tests the source runs through .github/quiet.sh, which
+#    keeps its output out of the job log (compiler and test output quotes source lines). On a
+#    failure those logs are encrypted to .github/log-cert.pem and only the encrypted file is
+#    uploaded (.github/actions/seal-logs).
+#  - No cache (compiled data is close to source). Only finished binaries and signatures are
+#    uploaded, and those are published anyway.
+#  - Nothing runs for pull requests: only the schedule and a manual start by someone with write
+#    access. The commit message is never printed.
+#
+# Every 10 minutes the `decide` job looks at the source's main branch. It builds when that commit
+# is not released yet, has not been attempted yet (a failed commit is not retried every 10 minutes:
+# fix it with a new commit, or start this workflow by hand with `force`), and its message has no
+# `[skip release]`. The source repository keeps its own release workflow as a manual fallback;
+# both take their version from scripts/next-version.sh in the source, so neither reuses a version.
+#
+# Secrets: SOURCE_DEPLOY_KEY (read-only deploy key of the source repository) and
+# CLUST_UPDATE_SEED (hex seed of the key every `clust update` trusts; only the `sign` job sees it).
+#
+# Reading a failed build: download the logs-* artifact of the run, then
+#   openssl cms -decrypt -inform DER -in logs-NAME.cms -inkey log-key.pem -out logs.txt
+# log-key.pem is the private half of .github/log-cert.pem and is kept outside GitHub.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build main even if it was already attempted or released
+        type: boolean
+        default: false
+      dry_run:
+        description: Build, test and sign, but publish nothing
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the attempt marker (refs/attempts/<sha>, not a branch or tag)
+    outputs:
+      build: ${{ steps.d.outputs.build }}
+      sha: ${{ steps.src.outputs.sha }}
+      version: ${{ steps.d.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: src
+        uses: ./.github/actions/source
+        with:
+          key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: main
+      - id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.src.outputs.sha }}
+          FORCE: ${{ inputs.force || false }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          r="$GITHUB_REPOSITORY"
+          echo "source main is $SHA"
+          last=$(gh release view --repo "$r" --json body -q .body 2>/dev/null | sed -n 's/^Build \([0-9a-f]\{40\}\).*/\1/p' || true)
+          build=true
+          if [ "$FORCE" != true ] && [ "$DRY_RUN" != true ]; then
+            if [ "$SHA" = "$last" ]; then
+              echo "already released"; build=false
+            elif git -C src log -1 --format=%B | grep -qF '[skip release]'; then
+              echo "the commit asks not to be released"; build=false
+            elif gh api "repos/$r/git/ref/attempts/$SHA" > /dev/null 2>&1; then
+              echo "already attempted; start this workflow by hand with force to retry"; build=false
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          if [ "$build" != true ]; then exit 0; fi
+          version=$(cd src && GH_TOKEN="$GH_TOKEN" bash scripts/next-version.sh "$r")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building v$version"
+          if [ "$DRY_RUN" != true ]; then
+            for old in $(gh api "repos/$r/git/matching-refs/attempts/" -q '.[].ref'); do
+              gh api -X DELETE "repos/$r/git/$old" > /dev/null
+            done
+            gh api "repos/$r/git/refs" -f ref="refs/attempts/$SHA" -f sha="$GITHUB_SHA" > /dev/null
+          fi
+
+  lint:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/source
+        with:
+          key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.decide.outputs.sha }}
+      - working-directory: src
+        run: |
+          rustup toolchain install
+          bash ../.github/quiet.sh fmt cargo fmt --all --check
+          bash ../.github/quiet.sh clippy cargo clippy --workspace --all-targets -- -D warnings
+      - if: failure()
+        uses: ./.github/actions/seal-logs
+        with:
+          name: lint
+
+  # On every platform clust ships for: Windows-only paths (pasting through the console,
+  # replacing the running executable) are only exercised on Windows.
+  test:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/source
+        with:
+          key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.decide.outputs.sha }}
+      - name: Install ffmpeg (transcription tests)
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -q && sudo apt-get install -y -q ffmpeg > /dev/null ;;
+            macOS) brew install -q ffmpeg > /dev/null ;;
+            Windows) choco install ffmpeg -y --no-progress > /dev/null ;;
+          esac
+      - working-directory: src
+        run: |
+          rustup toolchain install
+          bash ../.github/quiet.sh test cargo test --workspace
+      - if: failure()
+        uses: ./.github/actions/seal-logs
+        with:
+          name: test-${{ runner.os }}
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: .exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/source
+        with:
+          key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.decide.outputs.sha }}
+      - if: matrix.musl
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools > /dev/null
+      - name: Build
+        working-directory: src
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          perl -0pi -e 's/^version = "[^"]*"/version = "${{ needs.decide.outputs.version }}"/m' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          bash ../.github/quiet.sh build cargo build --profile dist --target ${{ matrix.target }} -p clust
+          mkdir -p ../out
+          out="../out/clust-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/dist/clust${{ matrix.ext }}" "$out"
+          # release assets carry no unix permissions; the archives below keep the bit, and
+          # `clust update` sets it on the raw binary it installs
+          chmod +x "$out" 2>/dev/null || true
+      - name: Ad-hoc sign (macOS)
+        if: runner.os == 'macOS'
+        working-directory: out
+        run: |
+          # before the update signature (sign job): codesign rewrites the binary's bytes, and the
+          # update signature must cover exactly the bytes that are published. No Developer ID is
+          # configured, so this cannot be notarized; an ad-hoc signature is still required for
+          # some code paths on Apple Silicon. curl (install.sh) sets no quarantine flag.
+          codesign --force -s - --timestamp=none "clust-${{ matrix.target }}"
+      - name: Package for direct download
+        working-directory: out
+        run: |
+          pkg="clust-${{ matrix.target }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$pkg.exe" clust.exe
+            7z a "$pkg.zip" clust.exe > /dev/null
+            rm clust.exe
+          else
+            cp "$pkg" clust
+            chmod +x clust
+            tar -czf "$pkg.tar.gz" clust
+            rm clust
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+      - if: failure()
+        uses: ./.github/actions/seal-logs
+        with:
+          name: build-${{ matrix.target }}
+
+  # One macOS download for the website: the two mac builds joined into a universal binary that
+  # runs natively on Apple Silicon and Intel. `clust update` and install.sh keep using the
+  # per-architecture files (half the size each).
+  macos-universal:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: 'bin-*-apple-darwin'
+          path: in
+          merge-multiple: true
+      - name: Join
+        run: |
+          out=clust-universal-apple-darwin
+          lipo -create -output "$out" in/clust-aarch64-apple-darwin in/clust-x86_64-apple-darwin
+          lipo "$out" -verify_arch arm64 x86_64
+          # sign the joined file so the signature covers exactly these bytes
+          codesign --force -s - --timestamp=none "$out"
+          codesign --verify "$out"
+          chmod +x "$out"
+          cp "$out" clust
+          tar -czf "$out.tar.gz" clust
+          rm clust
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-universal-apple-darwin
+          path: |
+            clust-universal-apple-darwin
+            clust-universal-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  # The only job that sees the signing seed: no third-party action, no cache, nothing built but
+  # the small xtask signer. It writes one detached signature per raw binary.
+  sign:
+    needs: [decide, lint, test, build, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/source
+        with:
+          key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.decide.outputs.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: 'bin-*'
+          path: dist
+          merge-multiple: true
+      - name: Sign
+        working-directory: src
+        env:
+          CLUST_UPDATE_SEED: ${{ secrets.CLUST_UPDATE_SEED }}
+        run: |
+          rustup toolchain install
+          bash ../.github/quiet.sh signer cargo build --quiet -p xtask
+          seed="$RUNNER_TEMP/seed"
+          printf '%s' "$CLUST_UPDATE_SEED" > "$seed"
+          n=0
+          for f in ../dist/clust-*; do
+            case "$f" in *.tar.gz|*.zip|*.sig) continue ;; esac
+            bash ../.github/quiet.sh "sign-$(basename "$f")" cargo xtask release-sign "$f" "$seed" || { rm -f "$seed"; exit 1; }
+            n=$((n + 1))
+          done
+          rm -f "$seed"
+          # six targets and the universal mac binary
+          test "$n" -eq 7
+          mkdir -p ../sigs
+          mv ../dist/*.sig ../sigs/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-signatures
+          path: sigs/*.sig
+          if-no-files-found: error
+      - if: failure()
+        uses: ./.github/actions/seal-logs
+        with:
+          name: sign
+
+  publish:
+    needs: [decide, sign]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: 'bin-*'
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.decide.outputs.version }}
+          SHA: ${{ needs.decide.outputs.sha }}
+        run: |
+          gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "v$VERSION" --notes "Build $SHA"

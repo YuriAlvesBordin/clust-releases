@@ -1,0 +1,38 @@
+name: source
+description: >
+  Fetches one commit of the private source repository into ./src with its read-only deploy key.
+  The key only ever lives in an ssh-agent that is stopped right after the fetch; it is never
+  written to disk. GitHub's host key is pinned, so the fetch cannot be redirected.
+inputs:
+  key:
+    description: the SOURCE_DEPLOY_KEY secret
+    required: true
+  ref:
+    description: a branch name or a full commit sha
+    required: true
+outputs:
+  sha:
+    description: the commit that was fetched
+    value: ${{ steps.fetch.outputs.sha }}
+runs:
+  using: composite
+  steps:
+    - id: fetch
+      shell: bash
+      env:
+        KEY: ${{ inputs.key }}
+        REF: ${{ inputs.ref }}
+      run: |
+        eval "$(ssh-agent -s)" > /dev/null
+        printf '%s\n' "$KEY" | ssh-add -q -
+        kh="$HOME/.source_known_hosts"
+        echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$kh"
+        export GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=yes"
+        git init -q src
+        ok=true
+        git -C src fetch -q --depth 1 git@github.com:YuriAlvesBordin/clust.git "$REF" || ok=false
+        ssh-agent -k > /dev/null
+        rm -f "$kh"
+        $ok
+        git -C src -c advice.detachedHead=false checkout -q FETCH_HEAD
+        echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
