@@ -1,6 +1,6 @@
 # Clust releases
 
-Signed binaries of [Clust](https://github.com/YuriAlvesBordin/clust), a terminal AI coding agent written in Rust.
+Signed binaries of [Clust](https://www.clustagent.com), a terminal AI coding agent.
 
 This repository holds release binaries and the installers only. There is no source code here.
 
